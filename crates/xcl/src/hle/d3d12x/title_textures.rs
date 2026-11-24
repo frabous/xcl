@@ -38,8 +38,16 @@ extern "system" {
     fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
 }
 
-/// (device, address its bytes are read from, layout, states) of an upload
-type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
+struct Upload {
+    device: usize,
+    src: usize,
+    tex: Arc<xg::Texture>,
+    states: Vec<D3D12_RESOURCE_STATES>,
+    seq: u64,
+    epoch: u64,
+    hashable: bool,
+    last_upload: Option<u64>,
+}
 
 struct Entry {
     device: usize,
@@ -67,6 +75,10 @@ struct Entry {
     unmapped: bool,
     /// monotonic registration order (newest wins when uncovering shadowed textures)
     seq: u64,
+    /// A source change or shadowing can invalidate an in-flight upload's fingerprint.
+    upload_epoch: u64,
+    hashable: bool,
+    last_upload: Option<u64>,
 }
 
 /// textures waiting for their first upload
@@ -195,6 +207,8 @@ impl Table {
             }
             self.by_va.remove(&(ova, ores));
             if let Some(mut old) = self.by_res.remove(&ores) {
+                old.upload_epoch += 1;
+                old.last_upload = None;
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -282,6 +296,14 @@ impl Table {
         by_res.get_mut(&res).or_else(|| shadowed.get_mut(&res))
     }
 
+    fn finish_upload(&mut self, res: usize, seq: u64, epoch: u64, hash: Option<u64>) {
+        if let Some(e) = self.by_res.get_mut(&res) {
+            if e.seq == seq && e.upload_epoch == epoch && !e.gpu_written {
+                e.last_upload = hash;
+            }
+        }
+    }
+
     fn overlapping(&self, va: usize, len: usize) -> Vec<(usize, usize)> {
         self.active_overlaps(va, va.saturating_add(len)).into_iter().take(4).map(|(ova, ores, _)| (ores, ova)).collect()
     }
@@ -324,8 +346,6 @@ pub fn counts() -> (usize, u64) {
 
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
-    // (a new texture object, or the address of an old one again: its first upload is not left out)
-    LAST_CONTENT.lock().unwrap().remove(&(res as usize));
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
@@ -381,6 +401,10 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         placed: super::vram::is_placed_texture(res as usize),
         unmapped: false,
         seq: 0,
+        upload_epoch: 0,
+        // The GPU may render to small targets without changing the CPU bytes.
+        hashable: !super::vram::gpu_owned(u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap())),
+        last_upload: None,
     };
     let to_unmap = {
         let mut t = TEXTURES.lock().unwrap();
@@ -443,6 +467,8 @@ fn recheck_source(e: &mut Entry) -> bool {
         return false;
     }
     e.src = src;
+    e.upload_epoch += 1;
+    e.last_upload = None;
     if !e.pending {
         e.pending = true;
         PENDING.fetch_add(1, Ordering::Relaxed);
@@ -461,6 +487,7 @@ pub fn note_gpu_write(res: usize) {
     if let Some(e) = t.get_mut(res) {
         if !e.gpu_written {
             e.gpu_written = true;
+            e.last_upload = None;
             GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -497,7 +524,6 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
-    LAST_CONTENT.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
         let (removed, delta, remap_ptrs) = t.remove(res);
@@ -761,27 +787,28 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), Upload {
+                    device: e.device,
+                    src: e.src,
+                    tex: Arc::clone(&e.tex),
+                    states: e.states.clone(),
+                    seq: e.seq,
+                    epoch: e.upload_epoch,
+                    hashable: e.hashable && !e.gpu_written,
+                    last_upload: e.last_upload,
+                }))
             })
             .collect()
     });
     upload_all(todo);
 }
 
-/// texture → `content_hash` of its memory at its last upload
-static LAST_CONTENT: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 static UNCHANGED: AtomicU64 = AtomicU64::new(0);
 
 /// `XCL_TEXTURE_SKIP_UNCHANGED=0` uploads a texture whenever its pages were written, as before.
 fn unchanged_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
-}
-
-/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
-/// content from here on (the caller uploads it when this is false).
-fn same_as_last_upload(res: usize, h: u64) -> bool {
-    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -814,37 +841,40 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             crate::xlog_warn!("title texture: upload failed: {e}");
         }
     };
+    let skip_unchanged = unchanged_skip();
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
         let mut batch = Vec::new();
+        let mut hashes = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
-        while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
+        while let Some((_, u)) = todo.peek() {
+            if !batch.is_empty() && (bytes + u.tex.size() as usize > BATCH_BYTES || u.device != device) {
                 break;
             }
-            let (r, (dev, va, tex, states)) = todo.next().unwrap();
-            // The same bytes as at this texture's last upload: nothing to do. The write watch is
-            // per page and a title writes next to its textures (and rewrites what it wrote): a
-            // retail title's video planes and UI targets went up again for every submit, ~25 MB
-            // a presented frame where ~3 MB had changed, and the submits waited here.
-            if unchanged_skip() {
-                let h = content_hash(&read_committed(va, tex.size() as usize));
-                if same_as_last_upload(r.as_raw() as usize, h) {
+            let (r, u) = todo.next().unwrap();
+            let subs = if skip_unchanged && u.hashable {
+                let texels = u.tex.texels().unwrap();
+                let mem = read_committed(u.src, texels.size() as usize);
+                let h = content_hash(&mem);
+                if u.last_upload == Some(h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
                         crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
                     }
                     continue;
                 }
-            }
-            device = dev;
-            bytes += tex.size() as usize;
-            let subs = subresources(va, &tex);
+                hashes.push((batch.len(), u.seq, u.epoch, h));
+                subresources_from(texels, |at, len| &mem[at..at + len])
+            } else {
+                subresources(u.src, &u.tex)
+            };
+            device = u.device;
+            bytes += u.tex.size() as usize;
             if super::present::trace_frame() {
-                note_content(va, &r, &subs);
+                note_content(u.src, &r, &subs);
             }
-            batch.push((r, subs, states));
+            batch.push((r, subs, u.states));
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
@@ -855,10 +885,21 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
-        match own_work(|| {
+        let result = own_work(|| {
             super::vram::before_execute(&queue);
             texture::upload_batch(dev, &queue, &batch)
-        }) {
+        });
+        if !hashes.is_empty() {
+            let mut t = TEXTURES.lock().unwrap();
+            for (i, seq, epoch, h) in hashes {
+                let res = batch[i].0.as_raw() as usize;
+                let success = result.as_ref().is_ok_and(|failed| {
+                    failed.binary_search_by_key(&i, |&(k, _)| k).is_err()
+                });
+                t.finish_upload(res, seq, epoch, success.then_some(h));
+            }
+        }
+        match result {
             Ok(failed) => {
                 for (_, e) in failed {
                     warn(&e);
@@ -1049,17 +1090,21 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
 unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let Some(tex) = tex.texels() else { return Vec::new() };
+    subresources_from(tex, |at, len| read_committed(va + at, len))
+}
+
+fn subresources_from<B: AsRef<[u8]>>(tex: &xg::Surface, mut read: impl FnMut(usize, usize) -> B) -> Vec<Subresource> {
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     if tex.depth > 0 {
-        let mem = read_committed(va, tex.size() as usize);
-        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
+        let mem = read(0, tex.size() as usize);
+        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(mem.as_ref(), i) }).collect();
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let slice = read_committed(va + s * c.slice_bytes, c.slice_bytes);
+        let slice = read(s * c.slice_bytes, c.slice_bytes);
         for (i, l) in c.levels.iter().enumerate() {
-            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
+            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(slice.as_ref(), i, s) });
         }
     }
     out
@@ -1070,33 +1115,19 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 mod tests {
     use super::*;
 
-    /// A texture is left out only when its memory hashes as at its own last upload, and a
-    /// texture that was forgotten (released, or its address registered again) is uploaded again.
     #[test]
-    fn a_texture_with_unchanged_memory_is_left_out_until_it_is_forgotten() {
-        let (a, b) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize);
+    fn content_hash_changes_with_any_byte_or_length() {
         let mut mem = vec![0u8; 3 << 20];
         mem[5] = 1;
         let h = content_hash(&mem);
-        assert!(!same_as_last_upload(a, h), "the first upload is not left out");
-        assert!(same_as_last_upload(a, h), "the same bytes again: left out");
-        assert!(!same_as_last_upload(b, h), "another texture over the same bytes has its own first upload");
         // one byte anywhere, also in the tail that is not a whole 32-byte step
         for at in [0usize, 31, 32, (3 << 20) - 1] {
             let mut m = mem.clone();
             m[at] ^= 0x80;
             assert_ne!(content_hash(&m), h, "byte {at} changed");
         }
-        mem[(3 << 20) - 1] = 9;
-        let h2 = content_hash(&mem);
-        assert!(!same_as_last_upload(a, h2), "changed memory is uploaded");
-        assert!(same_as_last_upload(a, h2));
         // the length is part of the content: a prefix of zeros is not the whole
         assert_ne!(content_hash(&[0u8; 64]), content_hash(&[0u8; 96]));
-        forget(a);
-        assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
-        forget(a);
-        forget(b);
     }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
@@ -1213,6 +1244,12 @@ mod tests {
                 assert_eq!(read_r8(dev, &queue, &texture), vec![value; 64 * 64], "GPU contents follow CPU writes");
                 assert_eq!(address(key), Some(va), "the title address stays in the GPU view");
             }
+            if unchanged_skip() {
+                let unchanged = UNCHANGED.load(Ordering::Relaxed);
+                std::ptr::write_bytes(src as *mut u8, 0x9A, PAGE);
+                refresh(queue.as_raw());
+                assert!(UNCHANGED.load(Ordering::Relaxed) > unchanged, "an identical CPU rewrite is skipped");
+            }
             let (mut count, mut id) = (1usize, 0usize);
             assert_eq!(kernelx::AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, &mut id), 1);
             let mut mapped = PhysicalPage { id, at: va };
@@ -1265,7 +1302,7 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0 };
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0, upload_epoch: 0, hashable: true, last_upload: None };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -1332,7 +1369,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, upload_epoch: 0, hashable: true, last_upload: None });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -1408,6 +1445,9 @@ mod tests {
             placed,
             unmapped: false,
             seq: 0,
+            upload_epoch: 0,
+            hashable: true,
+            last_upload: None,
         };
         let mut tbl = Table::new();
         // Two adjacent placed 16 KiB textures + one placed 64 KiB texture after them.
@@ -1415,6 +1455,12 @@ mod tests {
         assert_eq!(tbl.insert(2, entry(0x10_4000, &tex_16k, true, true)), (1, vec![]));
         assert_eq!(tbl.insert(3, entry(0x11_0000, &tex_64k, false, true)), (0, vec![]));
         assert_eq!(tbl.by_res.len(), 3);
+        let seq = tbl.by_res[&2].seq;
+        tbl.finish_upload(2, seq, 0, Some(10));
+        assert_eq!(tbl.by_res[&2].last_upload, Some(10));
+        tbl.finish_upload(2, seq, 0, None);
+        assert_eq!(tbl.by_res[&2].last_upload, None, "a failed upload cannot be skipped");
+        tbl.finish_upload(2, seq, 0, Some(10));
         // Exact same-range sibling over 2 shadows 2 without unmapping (tiles are shared).
         assert_eq!(tbl.insert(20, entry(0x10_4000, &tex_16k, false, true)), (-1, vec![]));
         assert!(!tbl.by_res.contains_key(&2) && tbl.shadowed.contains_key(&2));
@@ -1432,6 +1478,8 @@ mod tests {
         let (removed, _, remap) = tbl.remove(20);
         assert_eq!((removed, remap), (true, vec![2]));
         assert!(tbl.by_res.contains_key(&2));
+        tbl.finish_upload(2, seq, 0, Some(10));
+        assert_eq!(tbl.by_res[&2].last_upload, None, "completion for old tiles cannot seed the remapped texture");
         assert_eq!(tbl.insert(5, entry(0x10_8000, &tex_64k, true, true)).0, 1);
         assert_eq!(tbl.overlapping(0x10_0000, 0x1_0000), vec![(1, 0x10_0000), (2, 0x10_4000), (5, 0x10_8000)]);
         // Two committed resources with the exact same range coexist; a shifted one shadows them.
@@ -1616,7 +1664,7 @@ mod tests {
             assert_eq!(read_sub(&same_b, 0), want_2b, "row 3: new placement readback");
             assert_eq!(read_sub(&same_a, 0), want_2b, "row 4: older exact-range alias shares tiles");
             drop(same_b);
-            write_tiled(base + 0x1000, &same_desc, 0x3C);
+            write_tiled(base + 0x1000, &same_desc, 0x1A);
             refresh(queue.as_raw());
             assert_eq!(read_sub(&same_a, 0), subresources(base + 0x1000, &xg::Texture::new(&same_desc).unwrap())[0].data, "row 6: releasing newer placement reactivates older one");
             drop(same_a);
@@ -1638,9 +1686,10 @@ mod tests {
             *(base as *mut u8) ^= 0xFF; // dirty page outside B, inside old_res
             refresh(queue.as_raw());
             assert_eq!(read_sub(&new_res, 0), want_b, "row 5: stale shadowed texture corrupted B");
-            // Releasing B remaps previously-unmapped old_res cleanly and restores its pixels.
+            // The remapped texture needs its pixels again even when the CPU bytes match its last upload.
+            write_tiled(base, &old_desc, 0xAA);
+            refresh(queue.as_raw());
             drop(new_res);
-            write_tiled(base, &old_desc, 0xD4);
             refresh(queue.as_raw());
             assert_eq!(read_sub(&old_res, 0), subresources(base, &xg::Texture::new(&old_desc).unwrap())[0].data, "reactivated unmapped texture remapped cleanly");
             drop(old_res);
